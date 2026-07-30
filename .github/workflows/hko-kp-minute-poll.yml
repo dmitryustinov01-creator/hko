@@ -1,0 +1,52 @@
+name: HKO King's Park — минутный опрос (накопление истории)
+
+# Расписание раз в 10 минут = частота обновления источника (Update Frequency
+# на странице датасета). Плюс ручной запуск кнопкой — для проверки, что
+# всё работает, не дожидаясь ближайшего тика по расписанию.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+# Без этого Action не сможет закоммитить файл обратно в репозиторий.
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Тянем текущее значение King's Park
+        run: |
+          set -e
+          curl -sf "https://data.weather.gov.hk/weatherAPI/hko_data/csdi/dataset/latest_1min_temperature_csdi_8.csv" \
+            -o /tmp/latest.csv
+          echo "--- получено ---"
+          cat /tmp/latest.csv
+
+      - name: Добавляем новую строку в накопительный архив (без дублей)
+        run: |
+          mkdir -p data
+          touch data/kings_park_1min_history.csv
+          # Метка времени уже в самом файле от HKO (первая колонка) —
+          # используем её как есть, не полагаемся на часы раннера GitHub.
+          tail -n +2 /tmp/latest.csv | while IFS=, read -r ts station temp; do
+            if [ -n "$ts" ] && ! grep -q "^${ts}," data/kings_park_1min_history.csv 2>/dev/null; then
+              echo "${ts},${station},${temp}" >> data/kings_park_1min_history.csv
+            fi
+          done
+          echo "Всего строк в архиве: $(wc -l < data/kings_park_1min_history.csv)"
+
+      - name: Коммитим накопленное (пропускаем, если новых строк не было)
+        run: |
+          git config user.name "hko-poller-bot"
+          git config user.email "actions@github.com"
+          git add data/kings_park_1min_history.csv
+          if git diff --cached --quiet; then
+            echo "Новых данных нет (тот же тик, что и в прошлый раз) — коммит пропущен"
+          else
+            git commit -m "King's Park: авто-опрос $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
