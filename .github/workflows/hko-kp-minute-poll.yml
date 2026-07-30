@@ -1,14 +1,10 @@
 name: HKO King's Park — минутный опрос (накопление истории)
 
-# Расписание раз в 10 минут = частота обновления источника (Update Frequency
-# на странице датасета). Плюс ручной запуск кнопкой — для проверки, что
-# всё работает, не дожидаясь ближайшего тика по расписанию.
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
-# Без этого Action не сможет закоммитить файл обратно в репозиторий.
 permissions:
   contents: write
 
@@ -23,20 +19,45 @@ jobs:
           set -e
           curl -sf "https://data.weather.gov.hk/weatherAPI/hko_data/csdi/dataset/latest_1min_temperature_csdi_8.csv" \
             -o /tmp/latest.csv
-          echo "--- получено ---"
+          echo "--- получено (сырое) ---"
           cat /tmp/latest.csv
 
       - name: Добавляем новую строку в накопительный архив (без дублей)
         run: |
           mkdir -p data
           touch data/kings_park_1min_history.csv
-          # Метка времени уже в самом файле от HKO (первая колонка) —
-          # используем её как есть, не полагаемся на часы раннера GitHub.
-          tail -n +2 /tmp/latest.csv | while IFS=, read -r ts station temp; do
-            if [ -n "$ts" ] && ! grep -q "^${ts}," data/kings_park_1min_history.csv 2>/dev/null; then
-              echo "${ts},${station},${temp}" >> data/kings_park_1min_history.csv
-            fi
-          done
+
+          # РЕАЛЬНЫЙ формат ответа (не тот, что в общей выгрузке по всем
+          # станциям!) — одна строка данных БЕЗ переноса, поля через запятую,
+          # запись повторена ТРИЖДЫ подряд (en / традиц.кит / упрощ.кит):
+          #   год,месяц,день,час,минута,<пусто>,таймзона,станция,значение, × 3
+          # Берём только ПЕРВЫЕ 9 полей (английский вариант) — остальные две
+          # копии избыточны, значение то же самое.
+          LINE=$(tail -n +2 /tmp/latest.csv | head -n 1)
+          if [ -z "$LINE" ]; then
+            echo "Пустой ответ, пропускаем этот тик"
+            exit 0
+          fi
+          IFS=',' read -r yr mo dy hr mi _blank tz station val _rest <<< "$LINE"
+
+          if [ -z "$yr" ] || [ -z "$val" ]; then
+            echo "Не удалось распарсить поля, сырая строка была: $LINE"
+            exit 0
+          fi
+
+          # Метка времени строится сами (год-месяц-день час:минута), с
+          # ведущими нулями — она же используется для дедупликации, поэтому
+          # должна включать ВСЁ (не только год, как было в прошлой версии —
+          # та ошибка значила, что дедуп сравнивал только год и блокировал
+          # вообще любую новую запись после самой первой).
+          TS=$(printf '%04d-%02d-%02dT%02d:%02d' "$yr" "$mo" "$dy" "$hr" "$mi")
+
+          if grep -q "^${TS}," data/kings_park_1min_history.csv 2>/dev/null; then
+            echo "Запись за $TS уже есть, пропускаем (тот же 10-минутный тик источника)"
+          else
+            echo "${TS},${station},${val}" >> data/kings_park_1min_history.csv
+            echo "Добавлено: ${TS},${station},${val}"
+          fi
           echo "Всего строк в архиве: $(wc -l < data/kings_park_1min_history.csv)"
 
       - name: Коммитим накопленное (пропускаем, если новых строк не было)
@@ -45,7 +66,7 @@ jobs:
           git config user.email "actions@github.com"
           git add data/kings_park_1min_history.csv
           if git diff --cached --quiet; then
-            echo "Новых данных нет (тот же тик, что и в прошлый раз) — коммит пропущен"
+            echo "Новых данных нет — коммит пропущен"
           else
             git commit -m "King's Park: авто-опрос $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             git push
